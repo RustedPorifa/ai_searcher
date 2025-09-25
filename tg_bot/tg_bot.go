@@ -1,6 +1,8 @@
 package tgbot
 
 import (
+	"log"
+	"strings"
 	"sync"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -27,6 +29,9 @@ var startKeyboard = tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardButtonData("Помощь", "help"),
 	),
 	tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("Реферал", "refferal"),
+	),
+	tgbotapi.NewInlineKeyboardRow(
 		tgbotapi.NewInlineKeyboardButtonURL("Телеграмм канал", "https://t.me/newsly_search"),
 	),
 )
@@ -46,14 +51,15 @@ func InitBot(token string) {
 
 	for update := range updates {
 		go func(update tgbotapi.Update) {
-			if update.Message.IsCommand() {
-				handleCommand(update)
-			} else if update.Message != nil {
-				handleMessage(update)
+			if update.Message != nil {
+				if update.Message.IsCommand() {
+					handleCommand(update)
+				} else {
+					handleMessage(update)
+				}
 			} else if update.CallbackQuery != nil {
 				handleCallback(update)
 			}
-
 		}(update)
 	}
 }
@@ -63,9 +69,19 @@ func InitBot(token string) {
 func handleCommand(update tgbotapi.Update) {
 	switch update.Message.Command() {
 	case "start":
-		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Добро пожаловать в наш бот!\nОн создан специально для быстрого поиска новостей.\n\nНажмите ниже на inline кнопку")
-		msg.ReplyMarkup = startKeyboard
-		sendMessage(msg)
+		args := update.Message.CommandArguments()
+		if args == "" {
+			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Добро пожаловать в наш бот!\nОн создан специально для быстрого поиска новостей.\n\nНажмите ниже на inline кнопку")
+			msg.ReplyMarkup = startKeyboard
+			sendMessage(msg)
+		} else if strings.HasPrefix(args, "ref_") {
+			referalUUID := strings.TrimPrefix(args, "ref_")
+			log.Println(referalUUID)
+			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Добро пожаловать в наш бот!\nОн создан специально для быстрого поиска новостей.\n\nНажмите ниже на inline кнопку")
+			msg.ReplyMarkup = startKeyboard
+			sendMessage(msg)
+		}
+
 	case "help":
 
 	default:
@@ -85,6 +101,7 @@ func handleMessage(update tgbotapi.Update) {
 		UserStateMu.Unlock()
 		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Запрос успешно сохранен. Ожидайте ответа от бота.")
 		sendMessage(msg)
+
 	default:
 		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Неизвестная команда")
 		sendMessage(msg)
@@ -94,11 +111,11 @@ func handleMessage(update tgbotapi.Update) {
 func handleCallback(update tgbotapi.Update) {
 	switch update.CallbackQuery.Data {
 	case "search":
-		msg := tgbotapi.NewMessage(update.CallbackQuery.Message.Chat.ID, "Введите запрос для поиска новостей\n\nЗапросом должен являться текст, по которому будет выполнен поиск новостей\nПример: Рынок криптовалют, лучшие тенденции, восходящие альт коины")
+		msg := tgbotapi.NewEditMessageText(update.CallbackQuery.Message.Chat.ID, update.CallbackQuery.Message.MessageID, "Введите запрос для поиска новостей\n\nЗапросом должен являться текст, по которому будет выполнен поиск новостей\nПример: Рынок криптовалют, лучшие тенденции, восходящие альт коины")
 		UserStateMu.Lock()
 		UserState[update.CallbackQuery.From.ID] = "user-search"
 		UserStateMu.Unlock()
-		sendMessage(msg)
+		editMessage(msg)
 	case "help":
 		msg := tgbotapi.NewMessage(update.CallbackQuery.Message.Chat.ID, "Добро пожаловать в наш бот!\nОн создан специально для быстрого поиска новостей.\n\nНажмите ниже на inline кнопку")
 		msg.ReplyMarkup = startKeyboard
@@ -110,5 +127,15 @@ func handleCallback(update tgbotapi.Update) {
 }
 
 func sendMessage(msg tgbotapi.MessageConfig) {
-	bot.Send(msg)
+	_, err := bot.Send(msg)
+	if err != nil {
+		log.Println("Failed to edit message: ", err)
+	}
+}
+
+func editMessage(msg tgbotapi.EditMessageTextConfig) {
+	_, err := bot.Send(msg)
+	if err != nil {
+		log.Println("Failed to edit message: ", err)
+	}
 }
