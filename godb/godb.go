@@ -2,141 +2,169 @@ package godb
 
 import (
 	"context"
-	"embed"
 	"errors"
 	"fmt"
+	"log"
 	"os"
-	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var db *pgx.Conn
-
-var migrationsFS embed.FS
+var pool *pgxpool.Pool
 
 func InitDB() {
-	conn, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
-		os.Exit(1)
+	dbURL := os.Getenv("DATABASE_URL")
+	// Контекст для создания пула соединений
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Создание пула соединений
+	var poolErr error
+	pool, poolErr = pgxpool.New(ctx, dbURL)
+	if poolErr != nil {
+		log.Panic("Ошибка в создании пула соединения: ", poolErr)
 	}
-	db = conn
+
+	//Проверка подключения к базе данных
+	if pingErr := pool.Ping(ctx); pingErr != nil {
+		log.Panic("Ошибка проверки подключения к базе данных: ", pingErr)
+	}
+
+	//Запуск миграции баз данных
+	runMigration()
 }
 
-// ApplyMigrations применяет все миграции из папки migrations
-func ApplyMigrations() error {
-	// Читаем все файлы из embedded FS
-	files, err := migrationsFS.ReadDir("migrations")
-	if err != nil {
-		return fmt.Errorf("failed to read migrations directory: %v", err)
+// Запускает мигррацию баз данных
+func runMigration() {
+	migrationSQL, readErr := os.ReadDir("./godb/migration")
+	if readErr != nil {
+		log.Panic("Ошибка чтения директории миграций: ", readErr)
 	}
-
-	// Сортируем файлы по имени (версии)
-	for _, file := range files {
-		if strings.HasSuffix(file.Name(), ".up.sql") {
-			content, err := migrationsFS.ReadFile("migrations/" + file.Name())
-			if err != nil {
-				return fmt.Errorf("failed to read migration %s: %v", file.Name(), err)
-			}
-
-			// Выполняем миграцию
-			_, err = db.Exec(context.Background(), string(content))
-			if err != nil {
-				return fmt.Errorf("failed to execute migration %s: %v", file.Name(), err)
-			}
-
-			fmt.Printf("Applied migration: %s\n", file.Name())
+	for _, file := range migrationSQL {
+		println(file.Name())
+		filePath := "./godb/migration/" + file.Name()
+		fileContent, err := os.ReadFile(filePath)
+		if err != nil {
+			log.Panic("Ошибка чтения файла миграции: ", err)
+		}
+		_, err = pool.Exec(context.Background(), string(fileContent))
+		if err != nil {
+			log.Panic("Ошибка выполнения миграции: ", err)
 		}
 	}
-
-	return nil
 }
 
-// CheckRequestsRemaining проверяет количество оставшихся запросов пользователя
-func CheckRequestsRemaining(userID int64) (int, error) {
-	var requests int
-	err := db.QueryRow(
-		context.Background(),
-		"SELECT requests_remaining FROM user_balances WHERE user_id = $1",
-		userID,
-	).Scan(&requests)
-
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, fmt.Errorf("user not found")
+// AddUserIfNotExists добавляет пользователя если его нет и создает реферальную ссылку
+// referralUUID - UUID пользователя, который пригласил (может быть пустой строкой)
+func AddUserIfNotExists(userID int64, referralUUID string) error {
+	ctx := context.Background()
+	if pool == nil {
+		return errors.New("pool is not initialized")
 	}
+	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("query failed: %w", err)
+		return fmt.Errorf("failed to begin tx: %w", err)
+	}
+	// Безопасный defer
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	// Валидируем и проверяем существование referralUUID
+	var referredBy *string
+	if referralUUID != "" {
+		var exists bool
+		err = tx.QueryRow(ctx, `
+			SELECT true
+			FROM referral_links
+			WHERE referral_uuid = $1::uuid
+		`, referralUUID).Scan(&exists)
+		if err != nil && err != pgx.ErrNoRows {
+			return fmt.Errorf("check referral failed: %w", err)
+		}
+		if err == nil { // найден
+			referredBy = &referralUUID
+		}
+		// если не найден — referredBy остаётся nil
 	}
 
-	return requests, nil
-}
-
-// AddNewUser добавляет нового пользователя и инициализирует его баланс
-func AddNewUser(userID int64) error {
-	tx, err := db.Begin(context.Background())
-	if err != nil {
-		return fmt.Errorf("begin transaction failed: %w", err)
-	}
-	defer tx.Rollback(context.Background())
-
-	// Добавляем пользователя
-	_, err = tx.Exec(
-		context.Background(),
-		"INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
-		userID,
-	)
+	// Вставляем пользователя
+	_, err = tx.Exec(ctx, `
+		INSERT INTO users (user_id, referred_by)
+		VALUES ($1, $2)
+		ON CONFLICT (user_id) DO NOTHING
+	`, userID, referredBy)
 	if err != nil {
 		return fmt.Errorf("insert user failed: %w", err)
 	}
 
-	// Инициализируем баланс
-	_, err = tx.Exec(
-		context.Background(),
-		`INSERT INTO user_balances (user_id, requests_remaining)
-         VALUES ($1, 5)
-         ON CONFLICT (user_id) DO NOTHING`,
-		userID,
-	)
+	// Создаём реф.ссылку
+	_, err = tx.Exec(ctx, `
+		INSERT INTO referral_links (user_id)
+		VALUES ($1)
+		ON CONFLICT (user_id) DO NOTHING
+	`, userID)
 	if err != nil {
-		return fmt.Errorf("init balance failed: %w", err)
+		return fmt.Errorf("insert referral link failed: %w", err)
 	}
 
-	return tx.Commit(context.Background())
+	err = tx.Commit(ctx)
+	if err != nil {
+		return fmt.Errorf("commit failed: %w", err)
+	}
+	tx = nil // необязательно, но явно
+	return nil
 }
 
-// CreateReferralLink создает реферальную ссылку для пользователя
-func CreateReferralLink(userID int64) (pgtype.UUID, error) {
-	var referralUUID pgtype.UUID
-	err := db.QueryRow(
-		context.Background(),
-		`INSERT INTO referral_links (user_id)
-         VALUES ($1)
-         RETURNING referral_uuid`,
-		userID,
-	).Scan(&referralUUID)
+// GetUserIDByReferralLink ищет user_id по реферальной ссылке (uuid)
+func GetUserIDByReferralLink(referralUUID string) (int64, error) {
+	ctx := context.Background()
+
+	var userID int64
+	err := pool.QueryRow(ctx, `
+		SELECT user_id
+		FROM referral_links
+		WHERE referral_uuid = $1
+	`, referralUUID).Scan(&userID)
 
 	if err != nil {
-		return pgtype.UUID{}, fmt.Errorf("failed to create referral link: %w", err)
+		return 0, err
+	}
+
+	return userID, nil
+}
+
+// AddRequests добавляет запросы пользователю по переданному количеству
+func AddRequests(userID int64, requestsToAdd int) error {
+	ctx := context.Background()
+
+	_, err := pool.Exec(ctx, `
+		UPDATE users
+		SET requests_remaining = requests_remaining + $1
+		WHERE user_id = $2
+	`, requestsToAdd, userID)
+
+	return err
+}
+
+// GetUserReferralLink возвращает referral_uuid для заданного пользователя
+func GetUserReferralLink(userID int64) (string, error) {
+	ctx := context.Background()
+
+	var referralUUID string
+	err := pool.QueryRow(ctx, `
+		SELECT referral_uuid
+		FROM referral_links
+		WHERE user_id = $1
+	`, userID).Scan(&referralUUID)
+
+	if err != nil {
+		return "", err
 	}
 
 	return referralUUID, nil
-}
-
-// AddRequests добавляет запросы к балансу пользователя
-func AddRequests(userID int64, additionalRequests int) error {
-	_, err := db.Exec(
-		context.Background(),
-		`UPDATE user_balances
-         SET requests_remaining = requests_remaining + $1
-         WHERE user_id = $2`,
-		additionalRequests,
-		userID,
-	)
-	if err != nil {
-		return fmt.Errorf("update balance failed: %w", err)
-	}
-
-	return nil
 }
