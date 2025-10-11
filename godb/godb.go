@@ -14,6 +14,14 @@ import (
 
 var pool *pgxpool.Pool
 
+type User struct {
+	UserID             int64   `json:"user_id"`
+	Role               string  `json:"role"`
+	RequestsRemaining  int     `json:"requests_remaining"`
+	ReferredBy         *string `json:"referred_by,omitempty"`
+	IsReferralRewarded bool    `json:"is_referral_rewarded"`
+}
+
 func InitDB() {
 	dbURL := os.Getenv("DATABASE_URL")
 	// Контекст для создания пула соединений
@@ -54,6 +62,69 @@ func runMigration() {
 			log.Panic("Ошибка выполнения миграции: ", err)
 		}
 	}
+}
+
+// AddAdminsIfNotExist добавляет пользователей как администраторов, если они не существуют
+// Если пользователь уже существует, обновляет его роль на администратора
+func AddAdminsIfNotExist(userIDs []int64) error {
+	ctx := context.Background()
+	if pool == nil {
+		return errors.New("pool is not initialized")
+	}
+
+	if len(userIDs) == 0 {
+		return nil
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin tx: %w", err)
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	// Сначала обновляем существующих пользователей до администраторов
+	_, err = tx.Exec(ctx, `
+        UPDATE users
+        SET role = 'admin'
+        WHERE user_id = ANY($1)
+    `, userIDs)
+	if err != nil {
+		return fmt.Errorf("failed to update existing users to admin: %w", err)
+	}
+
+	// Затем добавляем новых пользователей как администраторов
+	for _, userID := range userIDs {
+		// Вставляем пользователя с ролью администратора
+		_, err = tx.Exec(ctx, `
+            INSERT INTO users (user_id, role)
+            VALUES ($1, 'admin')
+            ON CONFLICT (user_id) DO NOTHING
+        `, userID)
+		if err != nil {
+			return fmt.Errorf("failed to insert admin user %d: %w", userID, err)
+		}
+
+		// Создаем реферальную ссылку для нового пользователя
+		_, err = tx.Exec(ctx, `
+            INSERT INTO referral_links (user_id)
+            VALUES ($1)
+            ON CONFLICT (user_id) DO NOTHING
+        `, userID)
+		if err != nil {
+			return fmt.Errorf("failed to create referral link for admin %d: %w", userID, err)
+		}
+	}
+
+	err = tx.Commit(ctx)
+	if err != nil {
+		return fmt.Errorf("commit failed: %w", err)
+	}
+	tx = nil
+	return nil
 }
 
 // AddUserIfNotExists добавляет пользователя если его нет и создает реферальную ссылку
@@ -139,16 +210,45 @@ func GetUserIDByReferralLink(referralUUID string) (int64, error) {
 }
 
 // AddRequests добавляет запросы пользователю по переданному количеству
-func AddRequests(userID int64, requestsToAdd int) error {
+// Только администраторы могут выполнять эту операцию
+func AddRequests(adminUserID, targetUserID int64, requestsToAdd int) error {
 	ctx := context.Background()
 
-	_, err := pool.Exec(ctx, `
-		UPDATE users
-		SET requests_remaining = requests_remaining + $1
-		WHERE user_id = $2
-	`, requestsToAdd, userID)
+	// Сначала проверяем, является ли пользователь администратором
+	var role string
+	err := pool.QueryRow(ctx, `
+        SELECT role
+        FROM users
+        WHERE user_id = $1
+    `, adminUserID).Scan(&role)
 
-	return err
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return fmt.Errorf("admin user not found")
+		}
+		return fmt.Errorf("failed to verify admin role: %w", err)
+	}
+
+	if role != "admin" {
+		return fmt.Errorf("user is not in admin group")
+	}
+
+	// Выполняем добавление запросов целевому пользователю
+	result, err := pool.Exec(ctx, `
+        UPDATE users
+        SET requests_remaining = requests_remaining + $1
+        WHERE user_id = $2
+    `, requestsToAdd, targetUserID)
+
+	if err != nil {
+		return fmt.Errorf("failed to add requests: %w", err)
+	}
+
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("target user not found")
+	}
+
+	return nil
 }
 
 // GetUserReferralLink возвращает referral_uuid для заданного пользователя
@@ -167,4 +267,94 @@ func GetUserReferralLink(userID int64) (string, error) {
 	}
 
 	return referralUUID, nil
+}
+
+// GetUser возвращает полную информацию о пользователе по его user_id
+func GetUser(userID int64) (*User, error) {
+	ctx := context.Background()
+
+	var user User
+	var referredByUUID *string
+
+	err := pool.QueryRow(ctx, `
+		SELECT user_id, role, requests_remaining, referred_by, is_refferal_rewarded
+		FROM users
+		WHERE user_id = $1
+	`, userID).Scan(
+		&user.UserID,
+		&user.Role,
+		&user.RequestsRemaining,
+		&referredByUUID,
+		&user.IsReferralRewarded,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	user.ReferredBy = referredByUUID
+	return &user, nil
+}
+
+// DecrementUserRequests уменьшает количество запросов пользователя на 1, если есть доступные запросы
+// Возвращает новое количество запросов или ошибку
+func DecrementUserRequests(userID int64) (int, error) {
+	ctx := context.Background()
+
+	var newRequests int
+	err := pool.QueryRow(ctx, `
+        UPDATE users
+        SET requests_remaining = requests_remaining - 1
+        WHERE user_id = $1 AND requests_remaining > 0
+        RETURNING requests_remaining
+    `, userID).Scan(&newRequests)
+
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			// Проверяем, существует ли пользователь и сколько у него запросов
+			var currentRequests int
+			err := pool.QueryRow(ctx, `
+                SELECT requests_remaining
+                FROM users
+                WHERE user_id = $1
+            `, userID).Scan(&currentRequests)
+
+			if err != nil {
+				if err == pgx.ErrNoRows {
+					return 0, fmt.Errorf("user not found")
+				}
+				return 0, fmt.Errorf("failed to check user requests: %w", err)
+			}
+
+			if currentRequests <= 0 {
+				return 0, fmt.Errorf("no requests available")
+			}
+
+			return 0, fmt.Errorf("unexpected error: failed to decrement requests")
+		}
+		return 0, fmt.Errorf("failed to decrement user requests: %w", err)
+	}
+
+	return newRequests, nil
+}
+
+// GetUserRequests возвращает количество оставшихся запросов пользователя
+func GetUserRequests(userID int64) (int, error) {
+	ctx := context.Background()
+
+	var requestsRemaining int
+	err := pool.QueryRow(ctx, `
+        SELECT requests_remaining
+        FROM users
+        WHERE user_id = $1
+    `, userID).Scan(&requestsRemaining)
+
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return 0, fmt.Errorf("user not found")
+		}
+		return 0, fmt.Errorf("failed to get user requests: %w", err)
+	}
+
+	return requestsRemaining, nil
 }
