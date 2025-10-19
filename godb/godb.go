@@ -338,6 +338,29 @@ func DecrementUserRequests(userID int64) (int, error) {
 	return newRequests, nil
 }
 
+// IncrementUserRequests увеличивает количество оставшихся запросов пользователя на 1.
+// Возвращает новое количество запросов или ошибку.
+func IncrementUserRequests(userID int64) (int, error) {
+	ctx := context.Background()
+
+	var newRequests int
+	err := pool.QueryRow(ctx, `
+        UPDATE users
+        SET requests_remaining = requests_remaining + 1
+        WHERE user_id = $1
+        RETURNING requests_remaining
+    `, userID).Scan(&newRequests)
+
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return 0, fmt.Errorf("user not found")
+		}
+		return 0, fmt.Errorf("failed to increment user requests: %w", err)
+	}
+
+	return newRequests, nil
+}
+
 // GetUserRequests возвращает количество оставшихся запросов пользователя
 func GetUserRequests(userID int64) (int, error) {
 	ctx := context.Background()

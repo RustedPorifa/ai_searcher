@@ -1,4 +1,4 @@
-DROP TABLE IF EXISTS referral_links CASCADE;
+--DROP TABLE IF EXISTS referral_links CASCADE;
 
 CREATE TABLE IF NOT EXISTS referral_links (
     user_id BIGINT PRIMARY KEY,
